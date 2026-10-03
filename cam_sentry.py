@@ -20,43 +20,72 @@ logging.basicConfig(
 logger = logging.getLogger("CamSentry")
 
 
-class TelegramNotifier:
-    def __init__(self, token: str, chat_id: str, cooldown: int = 60):
-        self.token = token
-        self.chat_id = chat_id
+class AlertDispatcher:
+    def __init__(self, tg_token=None, tg_chat_id=None, discord_webhook=None, cooldown=60, channels="all"):
+        self.tg_token = tg_token
+        self.tg_chat_id = tg_chat_id
+        self.discord_webhook = discord_webhook
         self.cooldown = cooldown
+        self.channels = channels
         self.last_sent = 0
-        self.enabled = bool(token and chat_id)
 
-        if not self.enabled:
-            logger.warning("Telegram credentials missing or incomplete. Alerts disabled.")
+        self.has_tg = bool(self.tg_token and self.tg_chat_id) and self.channels in ("all", "telegram")
+        self.has_dc = bool(self.discord_webhook) and self.channels in ("all", "discord")
+
+        if not self.has_tg and not self.has_dc:
+            logger.warning("No active notification channels configured. Alerts are disabled.")
+        else:
+            active = []
+            if self.has_tg: active.append("Telegram")
+            if self.has_dc: active.append("Discord")
+            logger.info("Active alert targets: %s", ", ".join(active))
 
     def can_send(self) -> bool:
-        return self.enabled and (time.time() - self.last_sent >= self.cooldown)
+        return (self.has_tg or self.has_dc) and (time.time() - self.last_sent >= self.cooldown)
 
-    def send_photo_async(self, file_path: str, caption: str):
+    def dispatch_async(self, file_path: str, message: str):
         if not self.can_send():
             return
         self.last_sent = time.time()
-        threading.Thread(target=self._upload, args=(file_path, caption), daemon=True).start()
+        threading.Thread(target=self._send_all, args=(file_path, message), daemon=True).start()
 
-    def _upload(self, file_path: str, caption: str):
-        url = f"https://api.telegram.org/bot{self.token}/sendPhoto"
+    def _send_all(self, file_path: str, message: str):
+        if self.has_tg:
+            self._send_telegram(file_path, message)
+        if self.has_dc:
+            self._send_discord(file_path, message)
+
+    def _send_telegram(self, file_path: str, caption: str):
+        url = f"https://api.telegram.org/bot{self.tg_token}/sendPhoto"
         try:
             with open(file_path, "rb") as photo:
-                payload = {"chat_id": self.chat_id, "caption": caption}
+                payload = {"chat_id": self.tg_chat_id, "caption": caption}
                 files = {"photo": photo}
                 res = requests.post(url, data=payload, files=files, timeout=12)
                 if res.status_code == 200:
-                    logger.info("Telegram alert dispatched successfully.")
+                    logger.info("[Telegram] Alert photo delivered.")
                 else:
-                    logger.error("Telegram API error (%s): %s", res.status_code, res.text)
+                    logger.error("[Telegram] Error (%s): %s", res.status_code, res.text)
         except Exception as err:
-            logger.error("Network error sending alert: %s", err)
+            logger.error("[Telegram] Network error: %s", err)
+
+    def _send_discord(self, file_path: str, caption: str):
+        try:
+            with open(file_path, "rb") as f:
+                filename = os.path.basename(file_path)
+                files = {"file": (filename, f, "image/jpeg")}
+                data = {"content": caption}
+                res = requests.post(self.discord_webhook, data=data, files=files, timeout=12)
+                if res.status_code in (200, 204):
+                    logger.info("[Discord] Alert photo delivered.")
+                else:
+                    logger.error("[Discord] Error (%s): %s", res.status_code, res.text)
+        except Exception as err:
+            logger.error("[Discord] Network error: %s", err)
 
 
 class MotionDetector:
-    def __init__(self, history: int = 500, var_threshold: int = 25):
+    def __init__(self, history=500, var_threshold=25):
         self.subtractor = cv2.createBackgroundSubtractorMOG2(
             history=history, varThreshold=var_threshold, detectShadows=True
         )
@@ -82,14 +111,18 @@ def run_sentry(args):
     os.makedirs(args.record_dir, exist_ok=True)
     os.makedirs(args.snap_dir, exist_ok=True)
 
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    notifier = TelegramNotifier(bot_token, chat_id, cooldown=args.cooldown)
+    dispatcher = AlertDispatcher(
+        tg_token=os.getenv("TELEGRAM_BOT_TOKEN"),
+        tg_chat_id=os.getenv("TELEGRAM_CHAT_ID"),
+        discord_webhook=os.getenv("DISCORD_WEBHOOK_URL"),
+        cooldown=args.cooldown,
+        channels=args.notify
+    )
     detector = MotionDetector()
 
     cap = cv2.VideoCapture(args.device)
     if not cap.isOpened():
-        logger.critical("Failed to open video capture device /dev/video%d", args.device)
+        logger.critical("Failed to open camera /dev/video%d", args.device)
         sys.exit(1)
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -98,7 +131,7 @@ def run_sentry(args):
     if fps <= 0 or fps > 60:
         fps = 20.0
 
-    logger.info("Initialized camera %d [%dx%d @ %.1f FPS]", args.device, width, height, fps)
+    logger.info("Camera %d initialized [%dx%d @ %.1f FPS]", args.device, width, height, fps)
 
     recording = False
     video_writer = None
@@ -120,19 +153,18 @@ def run_sentry(args):
                 for (x, y, w, h) in boxes:
                     cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-                if notifier.can_send():
-                    timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if dispatcher.can_send():
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     snap_path = os.path.join(args.snap_dir, f"alert_{int(current_time)}.jpg")
                     cv2.imwrite(snap_path, snapshot)
-                    caption = f"🚨 CamSentry: Motion Detected!\nTimestamp: {timestamp_str}"
-                    notifier.send_photo_async(snap_path, caption)
+                    msg = f"🚨 **CamSentry Alert: Motion Detected!**\n⏱️ Timestamp: `{ts}`"
+                    dispatcher.dispatch_async(snap_path, msg)
 
                 if not recording:
                     recording = True
                     fname = datetime.now().strftime("motion_%Y%m%d_%H%M%S.mp4")
                     fpath = os.path.join(args.record_dir, fname)
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    video_writer = cv2.VideoWriter(fpath, fourcc, fps, (width, height))
+                    video_writer = cv2.VideoWriter(fpath, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
                     logger.info("Recording started: %s", fpath)
 
             if recording:
@@ -150,7 +182,7 @@ def run_sentry(args):
                 cv2.imshow("CamSentry Monitor", frame)
 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
-                    logger.info("Stopping...")
+                    logger.info("Stop key pressed. Exiting...")
                     break
 
     except KeyboardInterrupt:
@@ -164,11 +196,12 @@ def run_sentry(args):
 
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="Surveillance tool for Linux.")
-    parser.add_argument("-d", "--device", type=int, default=0, help="Camera device index")
-    parser.add_argument("-s", "--sensitivity", type=int, default=2500, help="Pixel area threshold")
-    parser.add_argument("-p", "--post-record", type=int, default=5, help="Post-motion recording seconds")
-    parser.add_argument("-c", "--cooldown", type=int, default=60, help="Alert cooldown in seconds")
+    parser = argparse.ArgumentParser(description="Surveillance tool with Discord & Telegram alerts.")
+    parser.add_argument("-d", "--device", type=int, default=0, help="Camera index (default: 0)")
+    parser.add_argument("-s", "--sensitivity", type=int, default=2500, help="Contour pixel area (default: 2500)")
+    parser.add_argument("-p", "--post-record", type=int, default=5, help="Post-motion record seconds (default: 5)")
+    parser.add_argument("-c", "--cooldown", type=int, default=60, help="Alert cooldown seconds (default: 60)")
+    parser.add_argument("-n", "--notify", choices=["all", "telegram", "discord"], default="all", help="Target channel")
     parser.add_argument("--record-dir", default="recordings", help="Video output folder")
     parser.add_argument("--snap-dir", default="snapshots", help="Snapshot output folder")
     parser.add_argument("--headless", action="store_true", help="Run without UI window")
