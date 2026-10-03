@@ -1,0 +1,13 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+
+# Secrets & environment variables
+.env
+
+# Captured media
+recordings/
+snapshots/
+*.mp4
+*.jpg
+*.png
